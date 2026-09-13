@@ -40,7 +40,7 @@ MODEL_NAME = "openai/gpt-oss-120b"
 # AGENT CONFIGURATION
 # ============================================================
 
-# Maximum characters from one tool result sent back to Groq
+# Maximum characters from one tool result
 MAX_TOOL_RESULT_CHARS = 3000
 
 # Maximum total research information used for report generation
@@ -52,11 +52,11 @@ MAX_AGENT_OUTPUT_TOKENS = 700
 # Maximum output tokens for final report
 MAX_REPORT_OUTPUT_TOKENS = 1200
 
-# Maximum number of tool calls in one research task
-MAX_TOOL_CALLS = 6
+# Maximum number of successful tool results
+MAX_TOOL_CALLS = 8
 
 # Maximum number of Groq decision rounds
-MAX_AGENT_TURNS = 4
+MAX_AGENT_TURNS = 6
 
 
 # ============================================================
@@ -188,7 +188,7 @@ def generate_report(
 ):
     """
     Generate final structured research report
-    using only collected research information.
+    using collected research information.
     """
 
     response = _create_completion(
@@ -211,13 +211,14 @@ def generate_report(
                     "Do not invent sources.\n"
                     "Do not invent URLs.\n"
                     "Do not claim that research was performed "
-                    "if no research information was provided.\n\n"
+                    "if no useful research information was provided.\n\n"
 
                     "If the research information contains "
-                    "sources, include them in the sources array.\n\n"
+                    "sources, include only real URLs that "
+                    "appear in the research information.\n\n"
 
-                    "If no sources are available, return an "
-                    "empty sources array.\n\n"
+                    "If no valid sources are available, return "
+                    "an empty sources array.\n\n"
 
                     "If the research information is insufficient "
                     "to answer the question, clearly say so."
@@ -379,7 +380,9 @@ def run_agent(user_query: str):
         ↓
     Read Webpage if needed
         ↓
-    Additional research if needed
+    Handle failed sources
+        ↓
+    Additional research
         ↓
     Final Report
     """
@@ -412,7 +415,7 @@ def run_agent(user_query: str):
 
 
     # --------------------------------------------------------
-    # Store research results
+    # Store successful research results
     # --------------------------------------------------------
 
     research_data = []
@@ -466,9 +469,25 @@ def run_agent(user_query: str):
                 "sources, continue researching instead of "
                 "immediately answering.\n\n"
 
-                "12. Before finishing, make sure you have "
-                "enough research information to answer "
-                "the user's question."
+                "12. If read_webpage returns "
+                "SOURCE_UNAVAILABLE, do NOT treat that "
+                "source as valid research.\n\n"
+
+                "13. If a webpage cannot be read, use "
+                "search_web again or choose another valid "
+                "source.\n\n"
+
+                "14. Never generate a final report based "
+                "only on SOURCE_UNAVAILABLE or tool error "
+                "messages.\n\n"
+
+                "15. Search results themselves can be used "
+                "as research information when webpage "
+                "reading fails.\n\n"
+
+                "16. Before finishing, make sure the "
+                "collected research contains useful "
+                "factual information."
             ),
         },
 
@@ -545,7 +564,7 @@ def run_agent(user_query: str):
 
 
             # ------------------------------------------------
-            # No research was performed
+            # No successful research
             # ------------------------------------------------
 
             if not research_data:
@@ -553,12 +572,13 @@ def run_agent(user_query: str):
                 content = (
                     response_message.content
                     or
-                    "The agent did not perform web research."
+                    "The agent could not obtain useful "
+                    "research information."
                 )
 
                 return {
 
-                    "title": "Research Result",
+                    "title": "Insufficient Research Data",
 
                     "summary": content,
 
@@ -566,7 +586,11 @@ def run_agent(user_query: str):
 
                     "sources": [],
 
-                    "conclusion": content,
+                    "conclusion": (
+                        "No reliable research data was "
+                        "available to generate a substantive "
+                        "report."
+                    ),
                 }
 
 
@@ -641,16 +665,23 @@ def run_agent(user_query: str):
 
             if function_name == "search_web":
 
-                function_args["max_results"] = min(
+                try:
 
-                    int(
+                    requested_results = int(
                         function_args.get(
                             "max_results",
                             5
                         )
-                    ),
+                    )
 
-                    5,
+                except (TypeError, ValueError):
+
+                    requested_results = 5
+
+
+                function_args["max_results"] = min(
+                    requested_results,
+                    5
                 )
 
 
@@ -728,20 +759,50 @@ def run_agent(user_query: str):
 
 
             # ------------------------------------------------
-            # Store research result
+            # Check whether result is usable
             # ------------------------------------------------
 
-            research_data.append(
-
-                {
-
-                    "tool": function_name,
-
-                    "arguments": function_args,
-
-                    "result": function_response,
-                }
+            source_unavailable = (
+                function_response.startswith(
+                    "SOURCE_UNAVAILABLE:"
+                )
             )
+
+            tool_failed = (
+                function_response.startswith(
+                    "Tool error:"
+                )
+                or
+                function_response.startswith(
+                    "Error:"
+                )
+            )
+
+
+            # ------------------------------------------------
+            # Store only useful research results
+            # ------------------------------------------------
+
+            if source_unavailable or tool_failed:
+
+                print(
+                    f"[Agent] Ignoring failed tool result "
+                    f"from {function_name}"
+                )
+
+            else:
+
+                research_data.append(
+
+                    {
+
+                        "tool": function_name,
+
+                        "arguments": function_args,
+
+                        "result": function_response,
+                    }
+                )
 
 
             # ------------------------------------------------
@@ -790,7 +851,7 @@ def run_agent(user_query: str):
 
 
     # --------------------------------------------------------
-    # If we have research, generate report
+    # If we have successful research, generate report
     # --------------------------------------------------------
 
     if research_data:
@@ -810,7 +871,7 @@ def run_agent(user_query: str):
 
 
     # --------------------------------------------------------
-    # No research
+    # No successful research
     # --------------------------------------------------------
 
     return {
@@ -818,7 +879,8 @@ def run_agent(user_query: str):
         "title": "Research Failed",
 
         "summary": (
-            "The research request could not be completed."
+            "The research request could not be completed "
+            "because no usable research information was obtained."
         ),
 
         "key_findings": [],
@@ -826,6 +888,7 @@ def run_agent(user_query: str):
         "sources": [],
 
         "conclusion": (
-            "No usable research information was obtained."
+            "Please try the research query again or use "
+            "a different topic."
         ),
     }
